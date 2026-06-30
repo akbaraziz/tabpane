@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tabpane</title>
+  <link rel="stylesheet" href="manager.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <h1>Tabpane</h1>
+    </div>
+
+    <div class="search-wrap">
+      <svg class="search-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 21l-4.3-4.3M11 18a7 7 0 1 1 0-14 7 7 0 0 1 0 14z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      <input id="search" type="text" placeholder="Search tabs by title or URL…  (press / to focus)" autocomplete="off" spellcheck="false" />
+      <kbd class="search-hint">/</kbd>
+    </div>
+
+    <div class="toolbar">
+      <div class="stat" id="stat-tabs"><strong>0</strong><span>tabs</span></div>
+      <div class="stat" id="stat-windows"><strong>0</strong><span>windows</span></div>
+      <div class="stat dupes" id="stat-dupes" hidden><strong>0</strong><span>duplicates</span></div>
+      <button class="btn" id="btn-dedupe" hidden>Close duplicates</button>
+      <button class="btn ghost" id="btn-sortdomain" title="Group the current view by site">Group by site</button>
+      <button class="btn" id="btn-save-top" title="Save all current tabs as a session">Save</button>
+      <button class="btn ghost" id="btn-sessions" title="Saved sessions" aria-pressed="false">Sessions</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <main id="board" class="board" aria-live="polite"></main>
+
+    <aside id="sessions-panel" class="sessions-panel" hidden aria-label="Saved sessions">
+      <div class="sessions-head">
+        <h2>Saved sessions</h2>
+        <button class="btn" id="btn-save-session">Save current</button>
+      </div>
+      <p class="sessions-hint">A session stores the tabs open right now so you can reopen them later. Stored locally on this device only.</p>
+      <ul id="sessions-list" class="sessions-list"></ul>
+      <p id="sessions-empty" class="sessions-empty" hidden>No saved sessions yet.</p>
+    </aside>
+  </div>
+
+  <script src="manager.js"></script>
+</body>
+</html>
