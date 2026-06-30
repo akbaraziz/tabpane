@@ -1,0 +1,5 @@
+# Local Claude session history / handoff buffer
+.remember/
+
+# macOS
+.DS_Store
