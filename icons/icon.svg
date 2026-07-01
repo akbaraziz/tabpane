@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Tabpane icon">
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#336DFF"/>
+  <rect x="9" y="9" width="110" height="110" rx="27" fill="none" stroke="#6EA2FF" stroke-width="2" opacity="0.7"/>
+
+  <g fill="#fff">
+    <rect x="28" y="36" width="21" height="58" rx="7" opacity="0.95"/>
+    <rect x="54" y="26" width="21" height="76" rx="7"/>
+    <rect x="80" y="43" width="21" height="42" rx="7" opacity="0.88"/>
+  </g>
+
+  <g fill="#1b48c8" opacity="0.28">
+    <rect x="34" y="47" width="9" height="4" rx="2"/>
+    <rect x="60" y="38" width="9" height="4" rx="2"/>
+    <rect x="86" y="54" width="9" height="4" rx="2"/>
+  </g>
+</svg>

@@ -31,6 +31,7 @@ const btnSaveTop = document.getElementById("btn-save-top");
 const MANAGER_URL = chrome.runtime.getURL("manager.html");
 
 const WINDOW_NAMES_KEY = "windowNames"; // { [windowId:string]: name }
+const ACTIVE_GROUP_CONTEXT_KEY = "activeGroupContext";
 const LEGACY_SESSIONS_KEY = "sessions"; // pre-sync local sessions
 const SYNC_SESSIONS_INDEX_KEY = "ss:v1:i";
 const SYNC_SESSION_CHUNK_PREFIX = "ss:v1:t:";
@@ -47,6 +48,8 @@ let query = "";
 let windowNames = {};  // mirror of storage
 let sessions = [];     // mirror of storage
 let sessionsSyncReady = true;
+let activeGroupContext = null;
+let lastWindowsSignature = "";
 
 /* Chrome tab-group color name -> hex (for the chip + left band) */
 const GROUP_COLORS = {
@@ -244,6 +247,10 @@ function normalizeGroupTitle(title) {
 function validGroupColor(color) {
   return VALID_GROUP_COLORS.has(color) ? color : "grey";
 }
+function nativeGroupId(value) {
+  const id = Number(value);
+  return Number.isFinite(id) && id !== -1 ? id : null;
+}
 function buildSyncSessionsPayload(inputSessions) {
   const source = normalizeSessions(inputSessions);
   for (let count = source.length; count >= 0; count--) {
@@ -314,30 +321,54 @@ function tryBuildSyncSessionsPayload(sourceSessions) {
 /* ---------- data ---------- */
 async function load() {
   if (pageUnloading) return;
-  let wins, groups;
+  let wins, groups, nextActiveGroupContext;
   try {
-    [wins, groups] = await Promise.all([
+    [wins, groups, nextActiveGroupContext] = await Promise.all([
       chrome.windows.getAll({ populate: true, windowTypes: ["normal"] }),
-      chrome.tabGroups ? chrome.tabGroups.query({}) : Promise.resolve([])
+      chrome.tabGroups ? chrome.tabGroups.query({}) : Promise.resolve([]),
+      loadActiveGroupContext()
     ]);
   } catch {
     return;
   }
+  activeGroupContext = nextActiveGroupContext;
   const groupById = new Map();
   for (const g of groups) groupById.set(g.id, { id: g.id, title: g.title || "", color: g.color, windowId: g.windowId });
 
-  allWindows = wins.map(w => ({
-    id: w.id,
-    focused: w.focused,
-    tabs: (w.tabs || [])
-      .filter(t => t.url !== MANAGER_URL)
-      .map(t => ({
-        id: t.id, windowId: t.windowId, index: t.index, url: t.url, title: t.title,
-        favIconUrl: t.favIconUrl, active: t.active, audible: t.audible,
-        pinned: t.pinned, groupId: t.groupId
-      })),
-    groupById
-  })).filter(w => w.tabs.length > 0);
+  const nextWindows = wins.map(w => {
+    const rawTabs = (w.tabs || []).filter(t => t.url !== MANAGER_URL);
+    for (const tab of rawTabs) {
+      const groupId = nativeGroupId(tab.groupId);
+      if (groupId === null || groupById.has(groupId)) continue;
+      const captured = activeGroupContext && activeGroupContext.groupId === groupId ? activeGroupContext : null;
+      groupById.set(groupId, {
+        id: groupId,
+        title: captured ? captured.groupTitle : "",
+        color: captured ? captured.groupColor : "grey",
+        windowId: w.id
+      });
+    }
+    return {
+      id: w.id,
+      focused: w.focused,
+      tabs: rawTabs.map(t => {
+        const groupId = nativeGroupId(t.groupId);
+        const meta = groupId !== null ? groupById.get(groupId) : null;
+        return {
+          id: t.id, windowId: t.windowId, index: t.index, url: t.url, title: t.title,
+          favIconUrl: t.favIconUrl, active: t.active, audible: t.audible,
+          pinned: t.pinned, groupId: t.groupId,
+          groupTitle: meta ? normalizeGroupTitle(meta.title) : "",
+          groupColor: meta ? validGroupColor(meta.color) : ""
+        };
+      }),
+      groupById
+    };
+  }).filter(w => w.tabs.length > 0);
+  const nextSignature = windowsSignature(nextWindows, activeGroupContext);
+  const windowsChanged = nextSignature !== lastWindowsSignature;
+  allWindows = nextWindows;
+  lastWindowsSignature = nextSignature;
 
   // prune names for windows that no longer exist
   const liveIds = new Set(allWindows.map(w => String(w.id)));
@@ -347,7 +378,52 @@ async function load() {
   }
   if (changed) saveWindowNames();
 
-  render();
+  if (windowsChanged || changed) render();
+}
+async function loadActiveGroupContext() {
+  try {
+    const got = await chrome.storage.local.get(ACTIVE_GROUP_CONTEXT_KEY);
+    return normalizeActiveGroupContext(got[ACTIVE_GROUP_CONTEXT_KEY]);
+  } catch {
+    return null;
+  }
+}
+function normalizeActiveGroupContext(value) {
+  if (!value || typeof value !== "object") return null;
+  const windowId = Number(value.windowId);
+  const groupId = Number(value.groupId);
+  const capturedAt = Number(value.capturedAt);
+  if (!Number.isFinite(windowId) || !Number.isFinite(groupId)) return null;
+  if (Number.isFinite(capturedAt) && Date.now() - capturedAt > 30 * 60 * 1000) return null;
+  return {
+    windowId,
+    tabId: Number.isFinite(value.tabId) ? Number(value.tabId) : null,
+    groupId,
+    groupTitle: String(value.groupTitle || "").slice(0, MAX_GROUP_TITLE_CHARS),
+    groupColor: validGroupColor(value.groupColor),
+    capturedAt: Number.isFinite(capturedAt) ? capturedAt : 0
+  };
+}
+function windowsSignature(windows, selectedContext) {
+  return JSON.stringify({
+    selectedContext,
+    windows: windows.map(win => ({
+      id: win.id,
+      focused: !!win.focused,
+      tabs: win.tabs.map(tab => ({
+        id: tab.id,
+        index: tab.index,
+        url: tab.url,
+        title: tab.title,
+        active: !!tab.active,
+        audible: !!tab.audible,
+        pinned: !!tab.pinned,
+        groupId: tab.groupId,
+        groupTitle: tab.groupTitle,
+        groupColor: tab.groupColor
+      }))
+    }))
+  });
 }
 
 // Count duplicate URLs using the SAME rules as closeDuplicates (skip pinned +
@@ -426,7 +502,7 @@ function faviconURL(pageUrl) {
   url.searchParams.set("size", "32");
   return url.toString();
 }
-function buildTab(tab, q, isDupe) {
+function buildTab(tab, q, isDupe, showGroupBadge = false) {
   const row = el("div", "tab");
   row.dataset.tabId = String(tab.id);
   row.dataset.windowId = String(tab.windowId);
@@ -450,6 +526,13 @@ function buildTab(tab, q, isDupe) {
     a.setAttribute("role", "img"); a.setAttribute("aria-label", "Playing audio");
     row.appendChild(a);
   }
+  if (showGroupBadge && tab.groupTitle) {
+    const badge = el("span", "tab-group-badge");
+    badge.title = "Chrome tab group";
+    badge.textContent = tab.groupTitle;
+    badge.style.setProperty("--tab-group-color", GROUP_COLORS[validGroupColor(tab.groupColor)]);
+    row.appendChild(badge);
+  }
   const x = el("button", "tab-x");
   x.title = "Close tab"; x.textContent = "✕"; x.dataset.action = "close-tab";
   x.setAttribute("aria-label", "Close tab");
@@ -458,19 +541,101 @@ function buildTab(tab, q, isDupe) {
 }
 function getWindowBoundGroup(win) {
   if (!win || !win.tabs || win.tabs.length === 0) return null;
-  const firstGroupId = win.tabs[0].groupId;
-  if (firstGroupId == null || firstGroupId === -1) return null;
+  const firstGroupId = nativeGroupId(win.tabs[0].groupId);
+  if (firstGroupId === null) return null;
   for (const tab of win.tabs) {
-    if (tab.groupId !== firstGroupId) return null;
+    if (nativeGroupId(tab.groupId) !== firstGroupId) return null;
   }
   const meta = win.groupById && win.groupById.get(firstGroupId);
   return meta ? { id: firstGroupId, meta } : null;
+}
+function getWindowGroupTitles(win) {
+  if (!win || !win.groupById) return [];
+  const titles = [];
+  const seen = new Set();
+  for (const tab of win.tabs || []) {
+    const groupId = nativeGroupId(tab.groupId);
+    if (groupId === null || seen.has(groupId)) continue;
+    const meta = win.groupById.get(groupId);
+    if (!meta) continue;
+    seen.add(groupId);
+    titles.push(normalizeGroupTitle(meta.title));
+  }
+  return titles;
+}
+function formatWindowGroupSuffix(titles) {
+  if (!titles.length) return "";
+  if (titles.length <= 2) return titles.join(", ");
+  return `${titles[0]}, ${titles[1]} +${titles.length - 2}`;
+}
+function getSelectedWindowGroupSuffix(win) {
+  if (!activeGroupContext || activeGroupContext.windowId !== win.id) return null;
+  if (activeGroupContext.groupId == null || activeGroupContext.groupId === -1) return "";
+  const meta = win.groupById && win.groupById.get(activeGroupContext.groupId);
+  return normalizeGroupTitle(meta ? meta.title : activeGroupContext.groupTitle);
 }
 function findGroupMeta(groupId) {
   for (const win of allWindows) {
     if (win.groupById && win.groupById.has(groupId)) return win.groupById.get(groupId);
   }
   return null;
+}
+function buildWindowPanels(win, windowIndex) {
+  const groupPanels = new Map();
+  const ungroupedTabs = [];
+  let firstUngroupedIndex = Infinity;
+
+  for (const tab of win.tabs || []) {
+    const groupId = nativeGroupId(tab.groupId);
+    const meta = groupId !== null && win.groupById ? win.groupById.get(groupId) : null;
+    if (!meta) {
+      ungroupedTabs.push(tab);
+      firstUngroupedIndex = Math.min(firstUngroupedIndex, tab.index);
+      continue;
+    }
+    if (!groupPanels.has(groupId)) {
+      groupPanels.set(groupId, {
+        kind: "group",
+        win,
+        windowIndex,
+        groupId,
+        meta,
+        tabs: [],
+        firstIndex: tab.index
+      });
+    }
+    const panel = groupPanels.get(groupId);
+    panel.tabs.push(tab);
+    panel.firstIndex = Math.min(panel.firstIndex, tab.index);
+  }
+
+  if (!groupPanels.size) {
+    return [{
+      kind: "window",
+      win,
+      windowIndex,
+      tabs: win.tabs || [],
+      firstIndex: 0,
+      hasSiblingGroups: false
+    }];
+  }
+
+  const panels = [];
+  if (ungroupedTabs.length) {
+    panels.push({
+      kind: "window",
+      win,
+      windowIndex,
+      tabs: ungroupedTabs,
+      firstIndex: firstUngroupedIndex,
+      hasSiblingGroups: true
+    });
+  }
+  panels.push(...groupPanels.values());
+  return panels.sort((a, b) => a.firstIndex - b.firstIndex);
+}
+function panelIsFocused(panel) {
+  return !!(panel.win.focused && panel.tabs.some(tab => tab.active));
 }
 
 /* ---------- render ---------- */
@@ -504,18 +669,32 @@ function renderInner() {
   const dupeCount = computeDuplicates();
   let totalTabs = 0;
   const totalDupes = countCloseableDuplicates();
+  const panels = [];
 
   const frag = document.createDocumentFragment();
 
   allWindows.forEach((win, idx) => {
     totalTabs += win.tabs.length;
-    const visible = q ? win.tabs.filter(t => haystack(t).includes(q)) : win.tabs;
+    panels.push(...buildWindowPanels(win, idx));
+  });
+
+  panels.forEach((panel, panelIdx) => {
+    const win = panel.win;
+    const visible = q ? panel.tabs.filter(t => haystack(t).includes(q)) : panel.tabs;
     if (visible.length === 0) return;
 
-    const boundGroup = getWindowBoundGroup(win);
+    const isGroupPanel = panel.kind === "group";
+    const boundGroup = isGroupPanel ? { id: panel.groupId, meta: panel.meta } : getWindowBoundGroup({ ...win, tabs: panel.tabs });
     const named = boundGroup ? normalizeGroupTitle(boundGroup.meta.title) : windowNames[String(win.id)];
-    const col = el("section", "window-col" + (win.focused ? " is-current" : "") + (named ? " is-named" : "") + (boundGroup ? " is-group-window" : ""));
+    const focused = panelIsFocused(panel);
+    const baseTitle = named || (focused ? "Current window" : "Window " + (panelIdx + 1));
+    const selectedGroupSuffix = boundGroup ? null : getSelectedWindowGroupSuffix(win);
+    const groupSuffix = boundGroup || panel.hasSiblingGroups ? "" : (selectedGroupSuffix ?? formatWindowGroupSuffix(getWindowGroupTitles(win)));
+    const displayTitle = groupSuffix ? `${baseTitle} (${groupSuffix})` : baseTitle;
+    const col = el("section", "window-col" + (focused ? " is-current" : "") + (named ? " is-named" : "") + (boundGroup ? " is-group-window" : ""));
     col.dataset.windowId = String(win.id);
+    col.dataset.panelKind = panel.kind;
+    col.dataset.panelId = boundGroup ? `${win.id}:g:${boundGroup.id}` : `${win.id}:w:${panel.firstIndex}`;
     if (boundGroup) {
       col.dataset.groupId = String(boundGroup.id);
       col.style.setProperty("--window-group-color", GROUP_COLORS[validGroupColor(boundGroup.meta.color)]);
@@ -525,36 +704,43 @@ function renderInner() {
     const head = el("div", "window-head");
     const dot = el("span", "window-dot");
     const wtitle = el("span", "window-title");
-    wtitle.dataset.action = "rename-window";
+    wtitle.dataset.action = boundGroup ? "rename-group" : "rename-window";
+    if (boundGroup) wtitle.dataset.groupId = String(boundGroup.id);
     wtitle.title = boundGroup ? "Double-click to rename Chrome tab group" : "Double-click to rename";
-    wtitle.textContent = named || (win.focused ? "Current window" : "Window " + (idx + 1));
+    wtitle.textContent = displayTitle;
     const rename = el("button", "window-rename");
-    rename.dataset.action = "rename-window";
+    rename.dataset.action = boundGroup ? "rename-group" : "rename-window";
+    if (boundGroup) rename.dataset.groupId = String(boundGroup.id);
     rename.title = boundGroup ? "Rename Chrome tab group" : "Rename window"; rename.textContent = "✎";
     rename.setAttribute("aria-label", boundGroup ? "Rename Chrome tab group" : "Rename window");
     const wcount = el("span", "window-count");
-    wcount.textContent = q ? `${visible.length} / ${win.tabs.length}` : String(win.tabs.length);
+    wcount.textContent = q ? `${visible.length} / ${panel.tabs.length}` : String(panel.tabs.length);
     const wclose = el("button", "window-close");
-    wclose.title = "Close this window"; wclose.textContent = "✕";
-    wclose.dataset.action = "close-window"; wclose.dataset.windowId = String(win.id);
-    wclose.setAttribute("aria-label", "Close this window");
+    wclose.title = boundGroup ? "Close this tab group" : "Close this window"; wclose.textContent = "✕";
+    wclose.dataset.action = boundGroup ? "close-group" : "close-window";
+    wclose.dataset.windowId = String(win.id);
+    if (boundGroup) wclose.dataset.groupId = String(boundGroup.id);
+    wclose.setAttribute("aria-label", boundGroup ? "Close this tab group" : "Close this window");
     head.append(dot, wtitle, rename, wcount, wclose);
     col.appendChild(head);
 
     // tab list
     const list = el("div", "tab-list");
     list.dataset.windowId = String(win.id);
+    list.dataset.panelId = col.dataset.panelId;
 
     if (groupBySite) {
       for (const [label, tabs] of groupByHost(visible)) {
         if (label) { const gl = el("div", "group-label"); gl.textContent = label; list.appendChild(gl); }
-        for (const tab of tabs) list.appendChild(buildTab(tab, q, isDupeTab(tab, dupeCount)));
+        for (const tab of tabs) list.appendChild(buildTab(tab, q, isDupeTab(tab, dupeCount), !isGroupPanel));
       }
+    } else if (isGroupPanel || panel.hasSiblingGroups) {
+      for (const tab of visible) list.appendChild(buildTab(tab, q, isDupeTab(tab, dupeCount)));
     } else {
       // preserve order but surface chrome tab-group bands
       let currentGroup = null, groupWrap = null;
       for (const tab of visible) {
-        const gid = (tab.groupId != null && tab.groupId !== -1) ? tab.groupId : null;
+        const gid = nativeGroupId(tab.groupId);
         if (gid !== currentGroup) {
           currentGroup = gid;
           if (gid != null && win.groupById.has(gid)) {
@@ -589,17 +775,17 @@ function renderInner() {
   // Capture scroll position of each window's tab list (keyed by window id,
   // which is stable across renders) so a background re-render doesn't yank
   // the user back to the top while they're scrolling.
-  const scrollByWindow = new Map();
+  const scrollByPanel = new Map();
   for (const listEl of board.querySelectorAll(".tab-list")) {
-    if (listEl.scrollTop > 0) scrollByWindow.set(listEl.dataset.windowId, listEl.scrollTop);
+    if (listEl.scrollTop > 0) scrollByPanel.set(listEl.dataset.panelId, listEl.scrollTop);
   }
 
   board.replaceChildren(frag);
 
   // Restore scroll positions onto the freshly built lists.
-  if (scrollByWindow.size) {
+  if (scrollByPanel.size) {
     for (const listEl of board.querySelectorAll(".tab-list")) {
-      const prev = scrollByWindow.get(listEl.dataset.windowId);
+      const prev = scrollByPanel.get(listEl.dataset.panelId);
       if (prev) listEl.scrollTop = prev;
     }
   }
@@ -641,6 +827,19 @@ async function closeTab(id) {
   // single debounced scheduler — closeTab never triggers its own reload.
   try { await chrome.tabs.remove(id); } catch {}
 }
+async function closeGroupTabs(windowId, groupId) {
+  const win = allWindows.find(w => w.id === windowId);
+  const ids = win ? win.tabs.filter(t => nativeGroupId(t.groupId) === groupId).map(t => t.id) : [];
+  if (!ids.length) return;
+  for (const w of allWindows) w.tabs = w.tabs.filter(t => !ids.includes(t.id));
+  allWindows = allWindows.filter(w => w.tabs.length > 0);
+  render();
+  for (const id of ids) {
+    try { await chrome.tabs.remove(id); }
+    catch (err) { console.warn("Tabpane: could not close grouped tab", id, err); }
+  }
+  scheduleLoad();
+}
 async function closeDuplicates() {
   const seen = new Set();
   const toClose = [];
@@ -665,16 +864,15 @@ async function closeDuplicates() {
 }
 
 /* ---------- window naming ---------- */
-function beginRename(windowId) {
-  const col = board.querySelector(`.window-col[data-window-id="${windowId}"]`);
+function beginRename(windowId, targetCol) {
+  const col = targetCol || board.querySelector(`.window-col[data-window-id="${windowId}"]`);
   if (!col) return;
   const titleEl = col.querySelector(".window-title");
   if (!titleEl || col.querySelector(".window-name-input")) return;
 
-  const win = allWindows.find(w => w.id === windowId);
-  const boundGroup = getWindowBoundGroup(win);
-  if (boundGroup) {
-    beginRenameGroup(boundGroup.id, titleEl, "window-name-input");
+  const groupId = Number(col.dataset.groupId);
+  if (Number.isFinite(groupId)) {
+    beginRenameGroup(groupId, titleEl, "window-name-input");
     return;
   }
 
@@ -804,6 +1002,8 @@ board.addEventListener("drop", async e => {
   if (!col) { clearDropMarkers(); return; }
   e.preventDefault();
   const targetWindowId = Number(col.dataset.windowId);
+  const targetGroupId = Number(col.dataset.groupId);
+  const targetIsGroup = Number.isFinite(targetGroupId);
 
   // Compute destination index from the drop marker. Use the target tab's real
   // Chrome tab index (not its position among the rendered rows) so the drop
@@ -816,12 +1016,21 @@ board.addEventListener("drop", async e => {
       const after = overTab.classList.contains("drop-after");
       index = overTabObj.index + (after ? 1 : 0);
     }
+  } else if (targetIsGroup) {
+    const targetWindow = allWindows.find(w => w.id === targetWindowId);
+    const groupTabs = targetWindow ? targetWindow.tabs.filter(t => nativeGroupId(t.groupId) === targetGroupId) : [];
+    if (groupTabs.length) index = Math.max(...groupTabs.map(t => t.index)) + 1;
   }
   const movingId = dragTabId;
   clearDropMarkers();
   dragTabId = null;
   try {
     await chrome.tabs.move(movingId, { windowId: targetWindowId, index });
+    if (targetIsGroup && chrome.tabs.group) {
+      await chrome.tabs.group({ tabIds: movingId, groupId: targetGroupId });
+    } else if (col.dataset.panelKind === "window" && chrome.tabs.ungroup) {
+      try { await chrome.tabs.ungroup(movingId); } catch {}
+    }
     await chrome.tabs.update(movingId, { active: true });
   } catch {}
   scheduleLoad();
@@ -841,16 +1050,26 @@ board.addEventListener("click", e => {
     chrome.windows.remove(Number(e.target.dataset.windowId)).catch(() => scheduleLoad());
     return;
   }
+  if (action === "close-group") {
+    e.stopPropagation();
+    const col = e.target.closest(".window-col");
+    const windowId = Number(e.target.dataset.windowId || col?.dataset.windowId);
+    const groupId = Number(e.target.dataset.groupId || col?.dataset.groupId);
+    if (Number.isFinite(windowId) && Number.isFinite(groupId)) closeGroupTabs(windowId, groupId);
+    return;
+  }
   if (action === "rename-window") {
     e.stopPropagation();
     const col = e.target.closest(".window-col");
-    if (col) beginRename(Number(col.dataset.windowId));
+    if (col) beginRename(Number(col.dataset.windowId), col);
     return;
   }
   if (action === "rename-group") {
     e.stopPropagation();
-    const groupId = Number(e.target.dataset.groupId || e.target.closest(".group-band")?.dataset.groupId);
-    if (Number.isFinite(groupId)) beginRenameGroup(groupId);
+    const col = e.target.closest(".window-col");
+    const groupId = Number(e.target.dataset.groupId || e.target.closest(".group-band")?.dataset.groupId || col?.dataset.groupId);
+    const target = col?.querySelector(".window-title") || e.target.closest(".window-title") || undefined;
+    if (Number.isFinite(groupId)) beginRenameGroup(groupId, target, col ? "window-name-input" : "group-name-input");
     return;
   }
   const row = e.target.closest(".tab");
@@ -860,7 +1079,10 @@ board.addEventListener("dblclick", e => {
   const titleEl = e.target.closest(".window-title");
   if (!titleEl) return;
   const col = e.target.closest(".window-col");
-  if (col) beginRename(Number(col.dataset.windowId));
+  if (!col) return;
+  const groupId = Number(col.dataset.groupId);
+  if (Number.isFinite(groupId)) beginRenameGroup(groupId, titleEl, "window-name-input");
+  else beginRename(Number(col.dataset.windowId), col);
 });
 
 /* ---------- sessions ---------- */
@@ -1101,6 +1323,10 @@ function scheduleLoad() {
 }
 const onAnyTabChange = () => scheduleLoad();
 const onStorageChanged = (changes, areaName) => {
+  if (areaName === "local" && ACTIVE_GROUP_CONTEXT_KEY in changes) {
+    scheduleLoad();
+    return;
+  }
   if (areaName !== "sync") return;
   if (!Object.keys(changes).some(isSyncSessionKey)) return;
   refreshSessionsFromSync();
@@ -1160,8 +1386,19 @@ chrome.windows.onCreated.addListener(onAnyTabChange);
 chrome.storage.onChanged.addListener(onStorageChanged);
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && pendingWhileHidden) { pendingWhileHidden = false; load(); }
+  if (!document.hidden) {
+    if (pendingWhileHidden) pendingWhileHidden = false;
+    scheduleLoad();
+  }
 });
+window.addEventListener("focus", onAnyTabChange);
+
+// Brave/Chromium builds can miss tabGroups events when groups are changed from
+// the native tab strip. Poll only while visible, and render only on signature
+// changes so this stays low-cost.
+const visibleRefreshTimer = setInterval(() => {
+  if (!document.hidden) scheduleLoad();
+}, 5000);
 
 /* ---------- teardown ---------- */
 window.addEventListener("pagehide", () => {
@@ -1172,7 +1409,9 @@ window.addEventListener("pagehide", () => {
   try { chrome.windows.onRemoved.removeListener(onAnyTabChange); } catch {}
   try { chrome.windows.onCreated.removeListener(onAnyTabChange); } catch {}
   try { chrome.storage.onChanged.removeListener(onStorageChanged); } catch {}
+  try { window.removeEventListener("focus", onAnyTabChange); } catch {}
   if (loadTimer !== null) clearTimeout(loadTimer);
+  if (visibleRefreshTimer !== null) clearInterval(visibleRefreshTimer);
   if (renderRaf !== null) cancelAnimationFrame(renderRaf);
   if (saveFlashTimer !== null) clearTimeout(saveFlashTimer);
 }, { once: true });

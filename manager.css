@@ -67,8 +67,8 @@ body {
 .brand-mark {
   width: 22px; height: 22px;
   border-radius: 7px;
-  background: conic-gradient(from 210deg, var(--accent), #7aa2ff, #3ddc97, var(--accent));
-  box-shadow: 0 0 0 1px var(--border-strong), 0 4px 12px rgba(91,140,255,0.35);
+  background: url("icons/icon32.png") center / contain no-repeat;
+  box-shadow: 0 4px 12px rgba(91,140,255,0.28);
 }
 
 .search-wrap {
@@ -263,6 +263,24 @@ body {
 }
 
 .tab-audio { color: var(--accent); flex-shrink: 0; font-size: 13px; }
+
+.tab-group-badge {
+  max-width: 84px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 0;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--tab-group-color, var(--border-strong)) 55%, transparent);
+  background: color-mix(in srgb, var(--tab-group-color, var(--surface-hover)) 18%, transparent);
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 1;
+  padding: 4px 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
 
 .tab-x {
   opacity: 0;

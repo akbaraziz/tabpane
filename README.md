@@ -1,6 +1,6 @@
 # Tabpane
 
-v1.1 — adds drag-to-move tabs between windows, window naming, saved sessions, and Chrome tab-group display.
+v1.1.x — adds drag-to-move tabs between windows, window naming, synced saved sessions, Chrome tab-group display, and grouped restore.
 
 A tab manager for Chrome and Chromium browsers (Edge, Brave, Arc, Opera, Vivaldi).
 Turns the cramped strip of favicons into a clean, searchable board where every tab
@@ -40,7 +40,7 @@ is large, legible, and one click away.
 
 ## Package
 
-Run `scripts/package-extension.sh` to create `dist/tabpane.zip` with only the extension files needed for upload or sharing.
+Run `scripts/package-extension.sh` to create `dist/tabpane.zip` and a versioned Chrome Web Store package named from `manifest.json`, such as `dist/tabpane-chrome-store-v<version>.zip`.
 
 ## Privacy
 
