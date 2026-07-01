@@ -16,7 +16,13 @@ is large, legible, and one click away.
 - **Find and close duplicates.** A counter shows how many duplicate tabs you have;
   one button closes the extras.
 - **Group by site.** Toggle to cluster each window's tabs by domain.
+- **Edit Chrome tab groups.** Rename a Chrome tab group from Tabpane and the
+  title updates in Chrome too.
 - **Spot audio tabs.** A ♪ marks tabs that are making noise.
+- **Save synced sessions.** Save your current web tabs and reopen them later on
+  devices using the same Chrome profile when Chrome Sync is enabled. Saved
+  Chrome tab groups keep their group names and reopen in their own grouped
+  windows.
 
 ## Keyboard
 
@@ -32,10 +38,16 @@ is large, legible, and one click away.
 3. Click **Load unpacked** and select this `tabpane` folder.
 4. Pin the Tabpane icon and click it to open the manager.
 
+## Package
+
+Run `scripts/package-extension.sh` to create `dist/tabpane.zip` with only the extension files needed for upload or sharing.
+
 ## Privacy
 
-Everything runs locally in your browser. No data leaves your machine; no network
-requests, no analytics.
+Everything runs in your browser. Tabpane has no servers, no analytics, and makes
+no app network requests. Saved sessions use Chrome's built-in sync storage when
+Chrome Sync is enabled for your profile; otherwise Chrome keeps them local.
+See `PRIVACY.md` for the full privacy policy.
 
 ## Files
 

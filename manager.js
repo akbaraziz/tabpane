@@ -3,7 +3,8 @@
 /* Tabpane manager — v1.1
  * Security: no innerHTML for any data (tabs, group titles, window/session names).
  *           All text via textContent. No inline handlers. CSP forbids inline/eval.
- *           Stored data (window names, sessions) is local-only; never transmitted.
+ *           Window names are local-only. Saved sessions use chrome.storage.sync
+ *           when available so they can follow the signed-in Chrome profile.
  * Memory:   single shared scheduler (one timer); board interaction is fully
  *           delegated (click + 4 drag listeners on the board container, regardless
  *           of tab count). All chrome + storage listeners removed on pagehide.
@@ -21,6 +22,7 @@ const btnDedupe = document.getElementById("btn-dedupe");
 const btnSortDomain = document.getElementById("btn-sortdomain");
 const btnSessions = document.getElementById("btn-sessions");
 const sessionsPanel = document.getElementById("sessions-panel");
+const sessionsHint = document.getElementById("sessions-hint");
 const sessionsList = document.getElementById("sessions-list");
 const sessionsEmpty = document.getElementById("sessions-empty");
 const btnSaveSession = document.getElementById("btn-save-session");
@@ -29,13 +31,22 @@ const btnSaveTop = document.getElementById("btn-save-top");
 const MANAGER_URL = chrome.runtime.getURL("manager.html");
 
 const WINDOW_NAMES_KEY = "windowNames"; // { [windowId:string]: name }
-const SESSIONS_KEY = "sessions";        // [{ id, name, createdAt, tabs:[{url,title}] }]
+const LEGACY_SESSIONS_KEY = "sessions"; // pre-sync local sessions
+const SYNC_SESSIONS_INDEX_KEY = "ss:v1:i";
+const SYNC_SESSION_CHUNK_PREFIX = "ss:v1:t:";
+const MAX_SESSIONS = 50;
+const MAX_SESSION_TITLE_CHARS = 240;
+const MAX_GROUP_TITLE_CHARS = 80;
+const MAX_SYNC_ITEM_BYTES = 7600;       // Chrome sync limit is ~8 KB per item.
+const MAX_SYNC_TOTAL_BYTES = 95000;     // Chrome sync limit is ~100 KB total.
+const MAX_SYNC_ITEMS_USED = 450;        // Leave room under Chrome's 512 item cap.
 
-let allWindows = [];   // [{ id, focused, tabs, groups: Map<groupId, {title,color}> }]
+let allWindows = [];   // [{ id, focused, tabs, groupById: Map<groupId, {title,color,windowId}> }]
 let groupBySite = false;
 let query = "";
 let windowNames = {};  // mirror of storage
 let sessions = [];     // mirror of storage
+let sessionsSyncReady = true;
 
 /* Chrome tab-group color name -> hex (for the chip + left band) */
 const GROUP_COLORS = {
@@ -43,6 +54,7 @@ const GROUP_COLORS = {
   green: "#3ddc97", pink: "#ff7eb6", purple: "#b48cff", cyan: "#4cd6e0",
   orange: "#ffa454"
 };
+const VALID_GROUP_COLORS = new Set(Object.keys(GROUP_COLORS));
 
 /* ---------- helpers (pure) ---------- */
 function hostOf(url) {
@@ -73,12 +85,23 @@ function timeAgo(ts) {
   return new Date(ts).toLocaleDateString();
 }
 
-/* ---------- storage (local only) ---------- */
+/* ---------- storage ---------- */
 async function loadStored() {
   try {
-    const got = await chrome.storage.local.get([WINDOW_NAMES_KEY, SESSIONS_KEY]);
+    await restrictSyncStorageAccess();
+    const got = await chrome.storage.local.get([WINDOW_NAMES_KEY, LEGACY_SESSIONS_KEY]);
     windowNames = got[WINDOW_NAMES_KEY] || {};
-    sessions = Array.isArray(got[SESSIONS_KEY]) ? got[SESSIONS_KEY] : [];
+    sessions = await loadSyncedSessions() || [];
+    const legacySessions = normalizeSessions(got[LEGACY_SESSIONS_KEY]);
+    if (legacySessions.length > 0) {
+      const merged = mergeSessions(legacySessions, sessions);
+      if (!sameSessions(sessions, merged)) {
+        sessions = merged;
+        if (await saveSessions()) {
+          try { await chrome.storage.local.remove(LEGACY_SESSIONS_KEY); } catch {}
+        }
+      }
+    }
   } catch {
     windowNames = {}; sessions = [];
   }
@@ -87,7 +110,205 @@ async function saveWindowNames() {
   try { await chrome.storage.local.set({ [WINDOW_NAMES_KEY]: windowNames }); } catch {}
 }
 async function saveSessions() {
-  try { await chrome.storage.local.set({ [SESSIONS_KEY]: sessions }); } catch {}
+  const snapshot = normalizeSessions(sessions);
+  const payload = buildSyncSessionsPayload(snapshot);
+  try {
+    await writeSyncedSessions(payload);
+    sessions = payload.sessions;
+    sessionsSyncReady = true;
+    return true;
+  } catch (err) {
+    sessionsSyncReady = false;
+    console.warn("Tabpane: saved sessions could not sync; keeping local fallback", err);
+    try { await chrome.storage.local.set({ [LEGACY_SESSIONS_KEY]: snapshot }); } catch {}
+    return false;
+  }
+}
+async function writeSyncedSessions(payload) {
+  const staleKeys = (await getSyncSessionKeys()).filter(key => !payload.activeKeys.has(key));
+  try {
+    await chrome.storage.sync.set(payload.values);
+  } catch (err) {
+    if (staleKeys.length === 0) throw err;
+    await chrome.storage.sync.remove(staleKeys);
+    await chrome.storage.sync.set(payload.values);
+    return;
+  }
+  if (staleKeys.length > 0) await chrome.storage.sync.remove(staleKeys);
+}
+async function restrictSyncStorageAccess() {
+  try {
+    if (chrome.storage.sync.setAccessLevel) {
+      await chrome.storage.sync.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
+    }
+  } catch {}
+}
+async function loadSyncedSessions() {
+  try {
+    const got = await chrome.storage.sync.get(SYNC_SESSIONS_INDEX_KEY);
+    const index = Array.isArray(got[SYNC_SESSIONS_INDEX_KEY]) ? got[SYNC_SESSIONS_INDEX_KEY] : [];
+    const chunkKeys = [];
+    for (const entry of index) {
+      if (!Array.isArray(entry.chunks)) continue;
+      for (const key of entry.chunks) {
+        if (isSyncSessionChunkKey(key)) chunkKeys.push(key);
+      }
+    }
+    const chunks = chunkKeys.length > 0 ? await chrome.storage.sync.get(chunkKeys) : {};
+    const loaded = [];
+    for (const entry of index) {
+      if (!entry || typeof entry !== "object" || !Array.isArray(entry.chunks)) continue;
+      const tabs = [];
+      for (const key of entry.chunks) {
+        const chunk = chunks[key];
+        if (Array.isArray(chunk)) tabs.push(...chunk);
+      }
+      const [session] = normalizeSessions([{ ...entry, tabs }]);
+      if (session) loaded.push(session);
+    }
+    sessionsSyncReady = true;
+    return loaded.slice(0, MAX_SESSIONS);
+  } catch (err) {
+    sessionsSyncReady = false;
+    console.warn("Tabpane: saved sessions could not be loaded from sync storage", err);
+    return null;
+  }
+}
+async function getSyncSessionKeys() {
+  const area = chrome.storage.sync;
+  try {
+    if (area.getKeys) return (await area.getKeys()).filter(isSyncSessionKey);
+  } catch {}
+  try {
+    return Object.keys(await area.get(null)).filter(isSyncSessionKey);
+  } catch {
+    return [];
+  }
+}
+function isSyncSessionKey(key) {
+  return key === SYNC_SESSIONS_INDEX_KEY || isSyncSessionChunkKey(key);
+}
+function isSyncSessionChunkKey(key) {
+  return typeof key === "string" && key.startsWith(SYNC_SESSION_CHUNK_PREFIX);
+}
+function normalizeSessions(value) {
+  if (!Array.isArray(value)) return [];
+  const normalized = [];
+  for (const session of value) {
+    if (!session || typeof session !== "object") continue;
+    const id = String(session.id || uid()).slice(0, 80);
+    const name = String(session.name || "Session").trim().slice(0, 80) || "Session";
+    const createdAt = Number.isFinite(session.createdAt) ? Number(session.createdAt) : Date.now();
+    const tabs = [];
+    if (Array.isArray(session.tabs)) {
+      for (const tab of session.tabs) {
+        const clean = normalizeSessionTab(tab);
+        if (clean) tabs.push(clean);
+      }
+    }
+    if (tabs.length > 0) normalized.push({ id, name, createdAt, tabs });
+    if (normalized.length >= MAX_SESSIONS) break;
+  }
+  return normalized.sort((a, b) => b.createdAt - a.createdAt);
+}
+function normalizeSessionTab(tab) {
+  if (!tab || typeof tab !== "object" || !/^https?:/.test(tab.url || "")) return null;
+  const clean = {
+    url: String(tab.url),
+    title: String(tab.title || "").slice(0, MAX_SESSION_TITLE_CHARS)
+  };
+  const groupKey = String(tab.groupKey || "").trim().slice(0, 120);
+  if (groupKey) {
+    clean.groupKey = groupKey;
+    clean.groupTitle = normalizeGroupTitle(tab.groupTitle || "Group");
+    if (VALID_GROUP_COLORS.has(tab.groupColor)) clean.groupColor = tab.groupColor;
+  }
+  return clean;
+}
+function mergeSessions(primary, secondary) {
+  const byId = new Map();
+  for (const session of [...normalizeSessions(primary), ...normalizeSessions(secondary)]) {
+    if (!byId.has(session.id)) byId.set(session.id, session);
+  }
+  return [...byId.values()].sort((a, b) => b.createdAt - a.createdAt).slice(0, MAX_SESSIONS);
+}
+function sameSessions(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+function syncItemBytes(key, value) {
+  return new TextEncoder().encode(key + JSON.stringify(value)).length;
+}
+function normalizeGroupTitle(title) {
+  return String(title || "").trim().slice(0, MAX_GROUP_TITLE_CHARS) || "Group";
+}
+function validGroupColor(color) {
+  return VALID_GROUP_COLORS.has(color) ? color : "grey";
+}
+function buildSyncSessionsPayload(inputSessions) {
+  const source = normalizeSessions(inputSessions);
+  for (let count = source.length; count >= 0; count--) {
+    const attempt = tryBuildSyncSessionsPayload(source.slice(0, count));
+    if (attempt) return attempt;
+  }
+  return {
+    sessions: [],
+    values: { [SYNC_SESSIONS_INDEX_KEY]: [] },
+    activeKeys: new Set([SYNC_SESSIONS_INDEX_KEY])
+  };
+}
+function tryBuildSyncSessionsPayload(sourceSessions) {
+  const values = {};
+  const activeKeys = new Set([SYNC_SESSIONS_INDEX_KEY]);
+  const index = [];
+  const savedSessions = [];
+  let totalBytes = 0;
+
+  for (const session of sourceSessions) {
+    const chunks = [];
+    let current = [];
+    let chunkIndex = 0;
+    for (const tab of session.tabs) {
+      const key = `${SYNC_SESSION_CHUNK_PREFIX}${session.id}:${chunkIndex}`;
+      if (syncItemBytes(key, [tab]) > MAX_SYNC_ITEM_BYTES) continue;
+      const next = current.concat(tab);
+      if (current.length > 0 && syncItemBytes(key, next) > MAX_SYNC_ITEM_BYTES) {
+        chunks.push({ key, tabs: current });
+        activeKeys.add(key);
+        chunkIndex += 1;
+        current = [tab];
+      } else {
+        current = next;
+      }
+    }
+    if (current.length > 0) {
+      const key = `${SYNC_SESSION_CHUNK_PREFIX}${session.id}:${chunkIndex}`;
+      chunks.push({ key, tabs: current });
+      activeKeys.add(key);
+    }
+    if (chunks.length === 0) continue;
+    index.push({
+      id: session.id,
+      name: session.name,
+      createdAt: session.createdAt,
+      tabCount: chunks.reduce((sum, chunk) => sum + chunk.tabs.length, 0),
+      chunks: chunks.map(chunk => chunk.key)
+    });
+    savedSessions.push({
+      id: session.id,
+      name: session.name,
+      createdAt: session.createdAt,
+      tabs: chunks.flatMap(chunk => chunk.tabs)
+    });
+    for (const chunk of chunks) values[chunk.key] = chunk.tabs;
+  }
+
+  values[SYNC_SESSIONS_INDEX_KEY] = index;
+  if (syncItemBytes(SYNC_SESSIONS_INDEX_KEY, index) > MAX_SYNC_ITEM_BYTES) return null;
+  const keys = Object.keys(values);
+  if (keys.length > MAX_SYNC_ITEMS_USED) return null;
+  for (const key of keys) totalBytes += syncItemBytes(key, values[key]);
+  if (totalBytes > MAX_SYNC_TOTAL_BYTES) return null;
+  return { sessions: savedSessions, values, activeKeys };
 }
 
 /* ---------- data ---------- */
@@ -103,7 +324,7 @@ async function load() {
     return;
   }
   const groupById = new Map();
-  for (const g of groups) groupById.set(g.id, { title: g.title || "", color: g.color });
+  for (const g of groups) groupById.set(g.id, { id: g.id, title: g.title || "", color: g.color, windowId: g.windowId });
 
   allWindows = wins.map(w => ({
     id: w.id,
@@ -111,7 +332,7 @@ async function load() {
     tabs: (w.tabs || [])
       .filter(t => t.url !== MANAGER_URL)
       .map(t => ({
-        id: t.id, windowId: t.windowId, url: t.url, title: t.title,
+        id: t.id, windowId: t.windowId, index: t.index, url: t.url, title: t.title,
         favIconUrl: t.favIconUrl, active: t.active, audible: t.audible,
         pinned: t.pinned, groupId: t.groupId
       })),
@@ -129,12 +350,23 @@ async function load() {
   render();
 }
 
+// Count duplicate URLs using the SAME rules as closeDuplicates (skip pinned +
+// internal pages) so the red "duplicate" highlight only marks tabs the
+// "Close duplicates" action would actually close — never a pinned or
+// chrome:// tab the button silently ignores.
 function computeDuplicates() {
   const seen = new Map();
   for (const w of allWindows)
-    for (const t of w.tabs)
+    for (const t of w.tabs) {
+      if (t.pinned || !/^https?:/.test(t.url)) continue;
       seen.set(t.url, (seen.get(t.url) || 0) + 1);
+    }
   return seen;
+}
+// A tab is shown as a duplicate only if it is itself closeable (non-pinned,
+// http(s)) and another closeable tab shares its URL.
+function isDupeTab(tab, dupeCount) {
+  return !tab.pinned && /^https?:/.test(tab.url) && dupeCount.get(tab.url) > 1;
 }
 
 // Counts how many tabs the "Close duplicates" action would actually close,
@@ -173,10 +405,11 @@ function setHighlighted(parent, text, q) {
 function buildFavicon(tab) {
   const wrap = el("div", "tab-fav");
   const letter = (hostOf(tab.url)[0] || "•").toUpperCase();
-  if (tab.favIconUrl && /^https?:|^data:image\//.test(tab.favIconUrl)) {
+  const faviconUrl = faviconURL(tab.url);
+  if (faviconUrl) {
     const img = document.createElement("img");
     img.alt = ""; img.referrerPolicy = "no-referrer"; img.loading = "lazy";
-    img.src = tab.favIconUrl;
+    img.src = faviconUrl;
     img.addEventListener("error", () => {
       const span = el("span", "fallback"); span.textContent = letter; img.replaceWith(span);
     }, { once: true });
@@ -185,6 +418,13 @@ function buildFavicon(tab) {
     const span = el("span", "fallback"); span.textContent = letter; wrap.appendChild(span);
   }
   return wrap;
+}
+function faviconURL(pageUrl) {
+  if (!/^https?:/.test(pageUrl || "")) return "";
+  const url = new URL(chrome.runtime.getURL("/_favicon/"));
+  url.searchParams.set("pageUrl", pageUrl);
+  url.searchParams.set("size", "32");
+  return url.toString();
 }
 function buildTab(tab, q, isDupe) {
   const row = el("div", "tab");
@@ -205,13 +445,32 @@ function buildTab(tab, q, isDupe) {
   row.appendChild(body);
 
   if (tab.audible) {
-    const a = el("span", "tab-audio"); a.title = "Playing audio"; a.textContent = "♪";
+    const a = el("span", "tab-audio");
+    a.title = "Playing audio"; a.textContent = "♪";
+    a.setAttribute("role", "img"); a.setAttribute("aria-label", "Playing audio");
     row.appendChild(a);
   }
   const x = el("button", "tab-x");
   x.title = "Close tab"; x.textContent = "✕"; x.dataset.action = "close-tab";
+  x.setAttribute("aria-label", "Close tab");
   row.appendChild(x);
   return row;
+}
+function getWindowBoundGroup(win) {
+  if (!win || !win.tabs || win.tabs.length === 0) return null;
+  const firstGroupId = win.tabs[0].groupId;
+  if (firstGroupId == null || firstGroupId === -1) return null;
+  for (const tab of win.tabs) {
+    if (tab.groupId !== firstGroupId) return null;
+  }
+  const meta = win.groupById && win.groupById.get(firstGroupId);
+  return meta ? { id: firstGroupId, meta } : null;
+}
+function findGroupMeta(groupId) {
+  for (const win of allWindows) {
+    if (win.groupById && win.groupById.has(groupId)) return win.groupById.get(groupId);
+  }
+  return null;
 }
 
 /* ---------- render ---------- */
@@ -219,6 +478,14 @@ let isRendering = false;
 let pageUnloading = false;
 let isEditing = false;        // true while a window/session name input is open
 let renderQueuedDuringEdit = false;
+let renderRaf = null;
+function scheduleRender() {
+  if (pageUnloading || renderRaf !== null) return;
+  renderRaf = requestAnimationFrame(() => {
+    renderRaf = null;
+    render();
+  });
+}
 function render() {
   if (pageUnloading) return;          // page is being torn down — do nothing
   if (isEditing) { renderQueuedDuringEdit = true; return; } // don't clobber an open input
@@ -245,25 +512,32 @@ function renderInner() {
     const visible = q ? win.tabs.filter(t => haystack(t).includes(q)) : win.tabs;
     if (visible.length === 0) return;
 
-    const named = windowNames[String(win.id)];
-    const col = el("section", "window-col" + (win.focused ? " is-current" : "") + (named ? " is-named" : ""));
+    const boundGroup = getWindowBoundGroup(win);
+    const named = boundGroup ? normalizeGroupTitle(boundGroup.meta.title) : windowNames[String(win.id)];
+    const col = el("section", "window-col" + (win.focused ? " is-current" : "") + (named ? " is-named" : "") + (boundGroup ? " is-group-window" : ""));
     col.dataset.windowId = String(win.id);
+    if (boundGroup) {
+      col.dataset.groupId = String(boundGroup.id);
+      col.style.setProperty("--window-group-color", GROUP_COLORS[validGroupColor(boundGroup.meta.color)]);
+    }
 
     // head
     const head = el("div", "window-head");
     const dot = el("span", "window-dot");
     const wtitle = el("span", "window-title");
     wtitle.dataset.action = "rename-window";
-    wtitle.title = "Double-click to rename";
+    wtitle.title = boundGroup ? "Double-click to rename Chrome tab group" : "Double-click to rename";
     wtitle.textContent = named || (win.focused ? "Current window" : "Window " + (idx + 1));
     const rename = el("button", "window-rename");
     rename.dataset.action = "rename-window";
-    rename.title = "Rename window"; rename.textContent = "✎";
+    rename.title = boundGroup ? "Rename Chrome tab group" : "Rename window"; rename.textContent = "✎";
+    rename.setAttribute("aria-label", boundGroup ? "Rename Chrome tab group" : "Rename window");
     const wcount = el("span", "window-count");
     wcount.textContent = q ? `${visible.length} / ${win.tabs.length}` : String(win.tabs.length);
     const wclose = el("button", "window-close");
     wclose.title = "Close this window"; wclose.textContent = "✕";
     wclose.dataset.action = "close-window"; wclose.dataset.windowId = String(win.id);
+    wclose.setAttribute("aria-label", "Close this window");
     head.append(dot, wtitle, rename, wcount, wclose);
     col.appendChild(head);
 
@@ -274,7 +548,7 @@ function renderInner() {
     if (groupBySite) {
       for (const [label, tabs] of groupByHost(visible)) {
         if (label) { const gl = el("div", "group-label"); gl.textContent = label; list.appendChild(gl); }
-        for (const tab of tabs) list.appendChild(buildTab(tab, q, dupeCount.get(tab.url) > 1));
+        for (const tab of tabs) list.appendChild(buildTab(tab, q, isDupeTab(tab, dupeCount)));
       }
     } else {
       // preserve order but surface chrome tab-group bands
@@ -287,8 +561,14 @@ function renderInner() {
             const meta = win.groupById.get(gid);
             const color = GROUP_COLORS[meta.color] || GROUP_COLORS.grey;
             const band = el("div", "group-band");
+            band.dataset.groupId = String(gid);
             const chip = el("span", "group-chip"); chip.style.background = color;
-            const name = el("span"); name.textContent = meta.title || "Group";
+            const name = el("button", "group-title");
+            name.type = "button";
+            name.dataset.action = "rename-group";
+            name.dataset.groupId = String(gid);
+            name.title = "Rename Chrome tab group";
+            name.textContent = normalizeGroupTitle(meta.title);
             band.append(chip, name);
             list.appendChild(band);
             groupWrap = el("div", "group-tabs");
@@ -298,7 +578,7 @@ function renderInner() {
             groupWrap = null;
           }
         }
-        const node = buildTab(tab, q, dupeCount.get(tab.url) > 1);
+        const node = buildTab(tab, q, isDupeTab(tab, dupeCount));
         (groupWrap || list).appendChild(node);
       }
     }
@@ -391,6 +671,13 @@ function beginRename(windowId) {
   const titleEl = col.querySelector(".window-title");
   if (!titleEl || col.querySelector(".window-name-input")) return;
 
+  const win = allWindows.find(w => w.id === windowId);
+  const boundGroup = getWindowBoundGroup(win);
+  if (boundGroup) {
+    beginRenameGroup(boundGroup.id, titleEl, "window-name-input");
+    return;
+  }
+
   isEditing = true;
 
   const input = el("input", "window-name-input");
@@ -422,13 +709,66 @@ function beginRename(windowId) {
   input.addEventListener("blur", () => commit(true), { once: true });
 }
 
+function beginRenameGroup(groupId, targetEl, inputClass = "group-name-input") {
+  const target = targetEl || board.querySelector(`.group-band[data-group-id="${groupId}"] .group-title`);
+  if (!target || target.parentElement.querySelector(`.${inputClass}`)) return;
+
+  const meta = findGroupMeta(groupId);
+  isEditing = true;
+
+  const input = el("input", inputClass);
+  input.type = "text";
+  input.maxLength = MAX_GROUP_TITLE_CHARS;
+  input.value = meta ? meta.title || "" : "";
+  input.placeholder = "Group name";
+  target.replaceWith(input);
+  input.focus(); input.select();
+
+  let done = false;
+  const commit = async (save) => {
+    if (done) return;
+    done = true;
+    if (save) {
+      const title = normalizeGroupTitle(input.value);
+      try {
+        await chrome.tabGroups.update(groupId, { title });
+        const live = findGroupMeta(groupId);
+        if (live) live.title = title;
+      } catch (err) {
+        console.warn("Tabpane: could not rename Chrome tab group", err);
+      }
+    }
+    isEditing = false;
+    renderQueuedDuringEdit = false;
+    render();
+  };
+  input.addEventListener("keydown", e => {
+    if (e.key === "Enter") { e.preventDefault(); commit(true); }
+    else if (e.key === "Escape") { e.preventDefault(); commit(false); }
+  });
+  input.addEventListener("blur", () => commit(true), { once: true });
+}
+
 /* ---------- drag & drop: move a tab into another window ---------- */
 let dragTabId = null;
+let dropTargetCol = null;
+let dropMarkerTab = null;
+let dropMarkerClass = null;
 function clearDropMarkers() {
-  for (const n of board.querySelectorAll(".drop-target"))
-    n.classList.remove("drop-target");
-  for (const n of board.querySelectorAll(".drop-before, .drop-after"))
-    n.classList.remove("drop-before", "drop-after");
+  if (dropTargetCol) dropTargetCol.classList.remove("drop-target");
+  if (dropMarkerTab && dropMarkerClass) dropMarkerTab.classList.remove(dropMarkerClass);
+  dropTargetCol = null;
+  dropMarkerTab = null;
+  dropMarkerClass = null;
+}
+function setDropMarkers(col, tab, markerClass) {
+  if (dropTargetCol === col && dropMarkerTab === tab && dropMarkerClass === markerClass) return;
+  clearDropMarkers();
+  dropTargetCol = col;
+  dropMarkerTab = tab;
+  dropMarkerClass = markerClass;
+  if (dropTargetCol) dropTargetCol.classList.add("drop-target");
+  if (dropMarkerTab && dropMarkerClass) dropMarkerTab.classList.add(dropMarkerClass);
 }
 board.addEventListener("dragstart", e => {
   const row = e.target.closest(".tab");
@@ -450,13 +790,13 @@ board.addEventListener("dragover", e => {
   if (!col) return;
   e.preventDefault();
   e.dataTransfer.dropEffect = "move";
-  clearDropMarkers();
-  col.classList.add("drop-target");
   const overTab = e.target.closest(".tab");
+  let markerClass = null;
   if (overTab && !overTab.classList.contains("dragging")) {
     const r = overTab.getBoundingClientRect();
-    overTab.classList.add((e.clientY - r.top) < r.height / 2 ? "drop-before" : "drop-after");
+    markerClass = (e.clientY - r.top) < r.height / 2 ? "drop-before" : "drop-after";
   }
+  setDropMarkers(col, overTab, markerClass);
 });
 board.addEventListener("drop", async e => {
   if (dragTabId == null) return;
@@ -465,15 +805,17 @@ board.addEventListener("drop", async e => {
   e.preventDefault();
   const targetWindowId = Number(col.dataset.windowId);
 
-  // compute destination index from the drop marker
+  // Compute destination index from the drop marker. Use the target tab's real
+  // Chrome tab index (not its position among the rendered rows) so the drop
+  // lands correctly even when a search filter is hiding tabs between them.
   let index = -1; // -1 = append
   const overTab = e.target.closest(".tab");
   if (overTab && !overTab.classList.contains("dragging")) {
-    const list = col.querySelector(".tab-list");
-    const rows = [...list.querySelectorAll(".tab")];
-    const pos = rows.indexOf(overTab);
-    const after = overTab.classList.contains("drop-after");
-    index = pos + (after ? 1 : 0);
+    const overTabObj = findTab(Number(overTab.dataset.tabId));
+    if (overTabObj) {
+      const after = overTab.classList.contains("drop-after");
+      index = overTabObj.index + (after ? 1 : 0);
+    }
   }
   const movingId = dragTabId;
   clearDropMarkers();
@@ -505,6 +847,12 @@ board.addEventListener("click", e => {
     if (col) beginRename(Number(col.dataset.windowId));
     return;
   }
+  if (action === "rename-group") {
+    e.stopPropagation();
+    const groupId = Number(e.target.dataset.groupId || e.target.closest(".group-band")?.dataset.groupId);
+    if (Number.isFinite(groupId)) beginRenameGroup(groupId);
+    return;
+  }
   const row = e.target.closest(".tab");
   if (row) { const tab = findTab(Number(row.dataset.tabId)); if (tab) switchTo(tab); }
 });
@@ -524,6 +872,7 @@ function toggleSessions() {
   if (open) renderSessions();
 }
 function renderSessions() {
+  renderSessionsHint();
   sessionsList.replaceChildren();
   sessionsEmpty.hidden = sessions.length > 0;
   for (const s of sessions) {
@@ -539,12 +888,16 @@ function renderSessions() {
     li.appendChild(top);
 
     const meta = el("div", "session-meta");
-    meta.textContent = `${s.tabs.length} tab${s.tabs.length === 1 ? "" : "s"} · ${timeAgo(s.createdAt)}`;
+    const groupCount = countSessionGroups(s);
+    const groupText = groupCount > 0 ? ` · ${groupCount} group${groupCount === 1 ? "" : "s"}` : "";
+    meta.textContent = `${s.tabs.length} tab${s.tabs.length === 1 ? "" : "s"}${groupText} · ${timeAgo(s.createdAt)}`;
     li.appendChild(meta);
 
     const actions = el("div", "session-actions");
     const open = el("button", "btn"); open.textContent = "Open"; open.dataset.action = "open-session";
+    open.title = "Open saved tabs. Saved Chrome tab groups open in their own windows.";
     const openNew = el("button", "btn ghost"); openNew.textContent = "New window"; openNew.dataset.action = "open-session-new";
+    openNew.title = "Open ungrouped tabs in a new window. Saved Chrome tab groups always open in their own windows.";
     const del = el("button", "btn ghost"); del.textContent = "Delete"; del.dataset.action = "delete-session";
     actions.append(open, openNew, del);
     li.appendChild(actions);
@@ -552,11 +905,29 @@ function renderSessions() {
     sessionsList.appendChild(li);
   }
 }
+function renderSessionsHint() {
+  sessionsHint.textContent = sessionsSyncReady
+    ? "A session stores the tabs open right now so you can reopen them later. Synced with your Chrome profile when Chrome Sync is on."
+    : "Sync is unavailable right now. New session changes are saved locally on this device.";
+}
+function countSessionGroups(session) {
+  return new Set((session.tabs || []).map(tab => tab.groupKey).filter(Boolean)).size;
+}
 async function saveCurrentSession() {
   const tabs = [];
-  for (const w of allWindows)
-    for (const t of w.tabs)
-      if (/^https?:/.test(t.url)) tabs.push({ url: t.url, title: t.title || "" });
+  for (const w of allWindows) {
+    for (const t of w.tabs) {
+      if (!/^https?:/.test(t.url)) continue;
+      const savedTab = { url: t.url, title: t.title || "" };
+      const meta = (t.groupId != null && t.groupId !== -1) ? w.groupById.get(t.groupId) : null;
+      if (meta) {
+        savedTab.groupKey = `${w.id}:${t.groupId}`;
+        savedTab.groupTitle = normalizeGroupTitle(meta.title);
+        savedTab.groupColor = validGroupColor(meta.color);
+      }
+      tabs.push(savedTab);
+    }
+  }
   if (!tabs.length) return 0;
   const stamp = new Date().toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
   sessions.unshift({ id: uid(), name: "Session — " + stamp, createdAt: Date.now(), tabs });
@@ -568,16 +939,70 @@ async function saveCurrentSession() {
 async function openSession(id, newWindow) {
   const s = sessions.find(x => x.id === id);
   if (!s || !s.tabs.length) return;
-  const urls = s.tabs.map(t => t.url).filter(u => /^https?:/.test(u));
-  if (!urls.length) return;
-  try {
-    if (newWindow) {
-      await chrome.windows.create({ url: urls });
-    } else {
-      for (const url of urls) await chrome.tabs.create({ url, active: false });
+  const { groups, ungrouped } = splitSessionTabsByGroup(s.tabs);
+  for (const group of groups) {
+    try {
+      await openSavedGroupInOwnWindow(group);
+    } catch (err) {
+      console.warn("Tabpane: could not open saved tab group", err);
     }
-  } catch {}
+  }
+  try {
+    const urls = ungrouped.map(t => t.url).filter(u => /^https?:/.test(u));
+    if (urls.length) {
+      if (newWindow) {
+        await chrome.windows.create({ url: urls });
+      } else {
+        for (const url of urls) await chrome.tabs.create({ url, active: false });
+      }
+    }
+  } catch (err) {
+    console.warn("Tabpane: could not open saved session", err);
+  }
   scheduleLoad();
+}
+function splitSessionTabsByGroup(tabs) {
+  const groupsByKey = new Map();
+  const ungrouped = [];
+  for (const tab of tabs) {
+    if (!tab || !/^https?:/.test(tab.url || "")) continue;
+    if (!tab.groupKey) {
+      ungrouped.push(tab);
+      continue;
+    }
+    if (!groupsByKey.has(tab.groupKey)) {
+      groupsByKey.set(tab.groupKey, {
+        key: tab.groupKey,
+        title: normalizeGroupTitle(tab.groupTitle),
+        color: validGroupColor(tab.groupColor),
+        tabs: []
+      });
+    }
+    groupsByKey.get(tab.groupKey).tabs.push(tab);
+  }
+  return {
+    groups: [...groupsByKey.values()].filter(group => group.tabs.length > 0),
+    ungrouped
+  };
+}
+async function openSavedGroupInOwnWindow(group) {
+  const urls = group.tabs.map(t => t.url).filter(u => /^https?:/.test(u));
+  if (!urls.length) return;
+  const created = await chrome.windows.create({ url: urls });
+  let createdTabs = Array.isArray(created && created.tabs) ? created.tabs : [];
+  if (created && created.id != null && createdTabs.length < urls.length) {
+    createdTabs = await chrome.tabs.query({ windowId: created.id });
+  }
+  const tabIds = createdTabs
+    .filter(tab => tab && tab.id != null && /^https?:/.test(tab.url || ""))
+    .sort((a, b) => a.index - b.index)
+    .map(tab => tab.id);
+  if (!tabIds.length || !chrome.tabs.group || !chrome.tabGroups) return;
+  const groupId = await chrome.tabs.group({ tabIds });
+  await chrome.tabGroups.update(groupId, {
+    title: normalizeGroupTitle(group.title),
+    color: validGroupColor(group.color)
+  });
 }
 async function deleteSession(id) {
   sessions = sessions.filter(s => s.id !== id);
@@ -625,10 +1050,10 @@ sessionsList.addEventListener("click", e => {
 });
 
 /* ---------- controls ---------- */
-searchEl.addEventListener("input", e => { query = e.target.value; render(); });
+searchEl.addEventListener("input", e => { query = e.target.value; scheduleRender(); });
 searchEl.addEventListener("keydown", e => {
   if (e.key === "Enter") { const first = board.querySelector(".tab"); if (first) first.click(); }
-  else if (e.key === "Escape") { searchEl.value = ""; query = ""; render(); searchEl.blur(); }
+  else if (e.key === "Escape") { searchEl.value = ""; query = ""; scheduleRender(); searchEl.blur(); }
 });
 document.addEventListener("keydown", e => {
   if (e.key === "/" && document.activeElement !== searchEl &&
@@ -641,7 +1066,7 @@ btnSortDomain.addEventListener("click", () => {
   groupBySite = !groupBySite;
   btnSortDomain.classList.toggle("ghost", groupBySite);
   btnSortDomain.textContent = groupBySite ? "Ungroup" : "Group by site";
-  render();
+  scheduleRender();
 });
 btnSessions.addEventListener("click", toggleSessions);
 btnSaveSession.addEventListener("click", saveCurrentSession);
@@ -675,6 +1100,31 @@ function scheduleLoad() {
   }, 150);
 }
 const onAnyTabChange = () => scheduleLoad();
+const onStorageChanged = (changes, areaName) => {
+  if (areaName !== "sync") return;
+  if (!Object.keys(changes).some(isSyncSessionKey)) return;
+  refreshSessionsFromSync();
+};
+let syncRefreshInFlight = false;
+async function refreshSessionsFromSync() {
+  if (pageUnloading || syncRefreshInFlight) return;
+  syncRefreshInFlight = true;
+  try {
+    const next = await loadSyncedSessions();
+    if (next === null) {
+      if (!sessionsPanel.hidden) renderSessionsHint();
+      return;
+    }
+    if (!sameSessions(sessions, next)) {
+      sessions = next;
+      if (!sessionsPanel.hidden) renderSessions();
+    } else if (!sessionsPanel.hidden) {
+      renderSessionsHint();
+    }
+  } finally {
+    syncRefreshInFlight = false;
+  }
+}
 
 // onUpdated fires very frequently (every loading-status flip, favicon byte,
 // etc.). Only react to changes that affect what we render, so background tab
@@ -707,6 +1157,7 @@ if (chrome.tabGroups) {
 }
 chrome.windows.onRemoved.addListener(onAnyTabChange);
 chrome.windows.onCreated.addListener(onAnyTabChange);
+chrome.storage.onChanged.addListener(onStorageChanged);
 
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden && pendingWhileHidden) { pendingWhileHidden = false; load(); }
@@ -720,7 +1171,9 @@ window.addEventListener("pagehide", () => {
   try { chrome.tabs.onUpdated.removeListener(onTabUpdated); } catch {}
   try { chrome.windows.onRemoved.removeListener(onAnyTabChange); } catch {}
   try { chrome.windows.onCreated.removeListener(onAnyTabChange); } catch {}
+  try { chrome.storage.onChanged.removeListener(onStorageChanged); } catch {}
   if (loadTimer !== null) clearTimeout(loadTimer);
+  if (renderRaf !== null) cancelAnimationFrame(renderRaf);
   if (saveFlashTimer !== null) clearTimeout(saveFlashTimer);
 }, { once: true });
 

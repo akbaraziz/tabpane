@@ -321,6 +321,10 @@ mark {
 .window-head:hover .window-rename { opacity: 1; }
 .window-rename:hover { color: var(--accent); background: var(--accent-soft); }
 .window-col.is-named .window-dot { background: var(--accent); box-shadow: 0 0 8px var(--accent-line); }
+.window-col.is-group-window .window-dot {
+  background: var(--window-group-color, var(--accent));
+  box-shadow: 0 0 8px color-mix(in srgb, var(--window-group-color, var(--accent)) 70%, transparent);
+}
 
 /* ---- drag & drop ---- */
 .tab { user-select: none; }
@@ -348,6 +352,37 @@ mark {
 }
 .group-chip {
   width: 9px; height: 9px; border-radius: 3px; flex-shrink: 0;
+}
+.group-title {
+  appearance: none;
+  border: 0;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  cursor: text;
+}
+.group-title:hover {
+  color: var(--text);
+  background: var(--surface-hover);
+}
+.group-name-input {
+  min-width: 0;
+  width: 100%;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid var(--accent-line);
+  background: rgba(91,140,255,0.08);
+  color: var(--text);
+  font: inherit;
+  text-transform: none;
+  letter-spacing: 0;
+  outline: none;
+  padding: 0 7px;
 }
 .group-tabs {
   border-left: 2px solid var(--group-color, var(--border-strong));
